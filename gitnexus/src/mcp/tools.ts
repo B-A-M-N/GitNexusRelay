@@ -508,4 +508,44 @@ WHEN TO USE: After changing group.yaml or re-indexing member repos.`,
       required: ['name'],
     },
   },
+  {
+    name: 'verify',
+    description: `Run project verification: tests, linter, and/or type-checker.
+Auto-detects the project type (Node.js, Python, Go, Rust, etc.) and runs the appropriate commands.
+
+WHEN TO USE: After making code changes — to confirm nothing broke. Use after detect_changes or impact analysis.
+AFTER THIS: Review failures. Use context() on failing symbols to understand the issue.
+
+Supports:
+- Node.js: npm test, npm run lint, tsc --noEmit
+- Python: pytest, python -m pytest, flake8, mypy
+- Go: go test ./..., go vet
+- Rust: cargo test, cargo clippy
+- Java: mvn test, gradle test
+- Ruby: bundle exec rspec, ruby -c
+- And more (auto-detection)
+
+Returns: pass/fail counts, failure details with file paths and line numbers, and a summary.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        type: {
+          type: 'string',
+          description: 'Verification type: "test", "lint", "typecheck", or "all" (default: "all")',
+          enum: ['test', 'lint', 'typecheck', 'all'],
+          default: 'all',
+        },
+        command: {
+          type: 'string',
+          description:
+            'Custom command to run (overrides auto-detection). e.g., "npm run test:unit"',
+        },
+        repo: {
+          type: 'string',
+          description: 'Repository name or path. Omit if only one repo is indexed.',
+        },
+      },
+      required: [],
+    },
+  },
 ];

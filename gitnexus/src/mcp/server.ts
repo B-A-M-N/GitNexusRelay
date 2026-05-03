@@ -301,7 +301,8 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
 
   // Graceful shutdown helper
   let shuttingDown = false;
-  const shutdown = async (exitCode = 0) => {
+  const shutdown = async (exitCodeValue: any = 0) => {
+    const exitCode = typeof exitCodeValue === 'number' ? exitCodeValue : 0;
     if (shuttingDown) return;
     shuttingDown = true;
     try {

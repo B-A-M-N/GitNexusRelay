@@ -14,6 +14,7 @@ import path from 'path';
 import fs from 'fs/promises';
 import { createRequire } from 'node:module';
 import { loadMeta, listRegisteredRepos, getStoragePath } from '../storage/repo-manager.js';
+import { listRuns, getRun, getEvents } from './event-store.js';
 import {
   executeQuery,
   executePrepared,
@@ -1666,6 +1667,115 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   const devWebDistDir = path.resolve(__dirname, '..', '..', '..', 'gitnexus-web', 'dist');
   const staticDir = await resolveWebDistDir(webDistDir, devWebDistDir);
   registerWebUI(app, staticDir);
+
+  // ── Live Activity / Run Events ─────────────────────────────────────
+
+  /** List recent runs. */
+  app.get('/api/runs', (_req, res) => {
+    try {
+      const limit = _req.query.limit ? parseInt(_req.query.limit as string, 10) : 50;
+      const runs = listRuns(limit);
+      res.json({ runs });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to list runs' });
+    }
+  });
+
+  /** Get a single run summary. */
+  app.get('/api/runs/:runId', (req, res) => {
+    try {
+      const run = getRun(req.params.runId);
+      if (!run) {
+        res.status(404).json({ error: 'Run not found' });
+        return;
+      }
+      res.json(run);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to get run' });
+    }
+  });
+
+  /**
+   * SSE stream of events for a run.
+   * Supports Last-Event-ID for reconnection.
+   * Polls the JSONL event store every 500ms for new events.
+   */
+  app.get('/api/runs/:runId/events', (req, res) => {
+    const { runId } = req.params;
+
+    // Check run exists
+    const run = getRun(runId);
+    if (!run) {
+      res.status(404).json({ error: 'Run not found' });
+      return;
+    }
+
+    // Parse Last-Event-ID for reconnection support
+    let lastEventId = 0;
+    const lastEventHeader = req.headers['last-event-id'];
+    if (typeof lastEventHeader === 'string') {
+      const parsed = parseInt(lastEventHeader, 10);
+      if (!isNaN(parsed)) lastEventId = parsed;
+    }
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+
+    // Send any existing events after the client's last known ID
+    const existingEvents = getEvents(runId, lastEventId);
+    for (const event of existingEvents) {
+      lastEventId = event.id;
+      res.write(`id: ${event.id}\ndata: ${JSON.stringify(event)}\n\n`);
+    }
+
+    // If run is already terminal, send complete and close
+    if (run.status === 'completed' || run.status === 'error') {
+      res.end();
+      return;
+    }
+
+    // Poll for new events every 500ms
+    const POLL_INTERVAL_MS = 500;
+    const pollTimer = setInterval(() => {
+      try {
+        const newEvents = getEvents(runId, lastEventId);
+        for (const event of newEvents) {
+          lastEventId = event.id;
+          res.write(`id: ${event.id}\ndata: ${JSON.stringify(event)}\n\n`);
+
+          // If this is a terminal event, close the stream
+          if (event.event === 'run.end' || event.event === 'run.error') {
+            clearInterval(pollTimer);
+            res.end();
+            return;
+          }
+        }
+      } catch (err) {
+        clearInterval(pollTimer);
+        res.end();
+      }
+    }, POLL_INTERVAL_MS);
+
+    // Heartbeat to keep connection alive
+    const heartbeat = setInterval(() => {
+      try {
+        res.write(':heartbeat\n\n');
+      } catch {
+        clearInterval(heartbeat);
+        clearInterval(pollTimer);
+      }
+    }, 15_000);
+
+    // Cleanup on client disconnect
+    req.on('close', () => {
+      clearInterval(pollTimer);
+      clearInterval(heartbeat);
+    });
+  });
 
   // Global error handler — catch anything the route handlers miss
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {

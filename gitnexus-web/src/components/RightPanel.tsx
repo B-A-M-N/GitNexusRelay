@@ -9,6 +9,7 @@ import {
   AlertTriangle,
   GitBranch,
   ArrowDown,
+  Zap,
 } from '@/lib/lucide-icons';
 import { useAppState } from '../hooks/useAppState';
 import { useAutoScroll } from '../hooks/useAutoScroll';
@@ -16,6 +17,7 @@ import { ToolCallCard } from './ToolCallCard';
 import { isProviderConfigured } from '../core/llm/settings-service';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { ProcessesPanel } from './ProcessesPanel';
+import { LiveActivityPanel } from './LiveActivityPanel';
 export const RightPanel = () => {
   const {
     isRightPanelOpen,
@@ -35,7 +37,7 @@ export const RightPanel = () => {
   } = useAppState();
 
   const [chatInput, setChatInput] = useState('');
-  const [activeTab, setActiveTab] = useState<'chat' | 'processes'>('chat');
+  const [activeTab, setActiveTab] = useState<'chat' | 'processes' | 'live'>('chat');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Keep streamed replies pinned unless the user intentionally scrolls away from the bottom.
   const { scrollContainerRef, messagesContainerRef, isAtBottom, scrollToBottom } = useAutoScroll(
@@ -243,6 +245,19 @@ export const RightPanel = () => {
               NEW
             </span>
           </button>
+
+          {/* Live Activity Tab */}
+          <button
+            onClick={() => setActiveTab('live')}
+            className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+              activeTab === 'live'
+                ? 'bg-accent/15 text-accent'
+                : 'text-text-muted hover:bg-hover hover:text-text-primary'
+            }`}
+          >
+            <Zap className="h-3.5 w-3.5" />
+            <span>Live</span>
+          </button>
         </div>
 
         {/* Close button */}
@@ -259,6 +274,13 @@ export const RightPanel = () => {
       {activeTab === 'processes' && (
         <div className="flex flex-1 flex-col overflow-hidden">
           <ProcessesPanel />
+        </div>
+      )}
+
+      {/* Live Activity Tab */}
+      {activeTab === 'live' && (
+        <div className="flex flex-1 flex-col overflow-hidden">
+          <LiveActivityPanel />
         </div>
       )}
 

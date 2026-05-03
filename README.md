@@ -1,4 +1,6 @@
-# GitNexus
+# GitNexusRelay
+
+> **Fork of [GitNexus](https://github.com/abhigyanpatwari/GitNexus)** — adds real-time event streaming, LiveActivityPanel, and enhanced MCP tooling.
 **⚠️ Important Notice:** GitNexus has NO official cryptocurrency, token, or coin. Any token/coin using the GitNexus name on Pump.fun or any other platform is **not affiliated with, endorsed by, or created by** this project or its maintainers. Do not purchase any cryptocurrency claiming association with GitNexus.
 
 <div align="center">
@@ -22,6 +24,14 @@
   <p><strong>Enterprise (SaaS & Self-hosted)</strong> - <a href="https://akonlabs.com">akonlabs.com</a></p>
 
 </div>
+
+### What's Added in GitNexusRelay
+
+- **LiveActivityPanel** — real-time activity feed component (`gitnexus-web/src/components/LiveActivityPanel.tsx`)
+- **Event Store** — server-side event streaming (`gitnexus/src/server/event-store.ts`)
+- **Enhanced MCP** — updated tools, server, and local backend for event-driven workflows
+- **Web UI** — new `gitnexus/web/` directory for standalone web deployment
+- **SSE routes** — Server-Sent Events wired into MCP→WebUI pipeline
 
 **Building nervous system for agent context.**
 

@@ -1,9 +1,17 @@
 {
   "mcpServers": {
     "gitnexus": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "gitnexus@latest", "mcp"]
+      "command": "/home/bamn/bin/micromamba",
+      "args": [
+        "run",
+        "-n",
+        "gitnexus-runtime",
+        "node",
+        "/home/bamn/GitNexus/gitnexus/dist/cli/mcp.js"
+      ],
+      "env": {
+        "LD_LIBRARY_PATH": "/home/bamn/mamba-envs/gitnexus-runtime/lib:$LD_LIBRARY_PATH"
+      }
     }
   }
 }

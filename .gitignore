@@ -54,8 +54,8 @@ HANDOFF*.md
 # Claude code skills
 .claude/skills/generated/
 
-# Assets (screenshots, images)
-assets/
+# Assets (screenshots, images) — root only
+/assets/
 
 # Generated files (should not be indexed)
 repomix-output*
@@ -107,3 +107,6 @@ local_docs/
 .tmp/
 .agents/
 .context/
+
+# Gemini security artifacts
+.gemini_security/

@@ -8,6 +8,7 @@
 
 import fs from 'fs/promises';
 import path from 'path';
+import { spawn } from 'child_process';
 import {
   initLbug,
   executeQuery,
@@ -22,6 +23,7 @@ export { isWriteQuery };
 // git utilities available if needed
 // import { isGitRepo, getCurrentCommit, getGitRoot } from '../../storage/git.js';
 import { parseDiffHunks, type FileDiff } from '../../storage/git.js';
+import { createRun, appendEvent, completeRun, failRun } from '../../server/event-store.js';
 import {
   listRegisteredRepos,
   cleanupOldKuzuFiles,
@@ -203,6 +205,19 @@ interface RepoHandle {
   stats?: RegistryEntry['stats'];
 }
 
+export interface SessionState {
+  /** Last query string — set automatically by query/context tools */
+  lastQuery?: string;
+  /** Symbol names from the last query result */
+  lastQuerySymbols?: string[];
+  /** Currently focused process name (set by query or explicitly) */
+  focusProcess?: string;
+  /** Last symbol that was contextualized */
+  lastContextSymbol?: string;
+  /** Last tool result — for chaining context across calls */
+  lastResult?: any;
+}
+
 export class LocalBackend {
   private repos: Map<string, RepoHandle> = new Map();
   private contextCache: Map<string, CodebaseContext> = new Map();
@@ -210,6 +225,8 @@ export class LocalBackend {
   private reinitPromises: Map<string, Promise<void>> = new Map();
   private lastStalenessCheck: Map<string, number> = new Map();
   private groupToolSvc: GroupService | null = null;
+  /** Lightweight session state shared across tool calls within a session. */
+  private session: SessionState = {};
   /**
    * One-shot stderr warnings for sibling-clone drift, keyed by
    * `${repoId}|${cwdGitRoot}`. Without this guard every tool call
@@ -624,9 +641,309 @@ export class LocalBackend {
     console.error(`GitNexus: ${match.hint}`);
   }
 
+  // ─── Helpers for live activity events ─────────────────────────────
+
+  /** Extract node IDs/symbol names from tool params for graph highlighting. */
+  /**
+   * Resolve graph node IDs from tool params (e.g. "myFunction" → "Function:myFunction").
+   * Queries the repo's graph DB to find matching nodes by name.
+   */
+  private async resolveNodeIds(
+    method: string,
+    params: any,
+    repo: RepoHandle | null,
+  ): Promise<string[]> {
+    if (!repo || !params || typeof params !== 'object') return [];
+    const p = params as Record<string, unknown>;
+    const names: string[] = [];
+
+    // Collect potential symbol names based on tool type
+    if (method === 'context' || method === 'rename' || method === 'explore') {
+      if (typeof p.name === 'string' && p.name) names.push(p.name);
+      if (typeof p.uid === 'string' && p.uid) names.push(p.uid);
+    }
+    if (method === 'impact') {
+      if (typeof p.target === 'string' && p.target) names.push(p.target);
+      if (typeof p.target_uid === 'string' && p.target_uid) names.push(p.target_uid);
+    }
+
+    if (names.length === 0) return [];
+
+    // Query the graph for matching nodes
+    try {
+      await this.ensureInitialized(repo.id);
+      const results: string[] = [];
+      for (const name of names) {
+        // If it's already a node ID (contains ":"), pass through
+        if (name.includes(':')) {
+          results.push(name);
+          continue;
+        }
+        const nodes = await executeParameterized(
+          repo.id,
+          `MATCH (n) WHERE n.name = $name RETURN labels(n)[0] AS label, n.name AS name LIMIT 10`,
+          { name },
+        );
+        for (const node of nodes) {
+          results.push(`${node.label}:${node.name}`);
+        }
+      }
+      return results;
+    } catch {
+      // If DB query fails, return empty — the event is still useful without node IDs
+      return [];
+    }
+  }
+
+  /** Detect which MCP client is calling (best-effort via env). */
+  private detectClient(): string | undefined {
+    // Claude Code sets this when spawning MCP servers
+    if (process.env.CLAUDE_CODE) return 'claude-code';
+    // Cursor detection
+    if (process.env.CURSOR) return 'cursor';
+    // Generic MCP client
+    if (process.env.MCP_CLIENT) return process.env.MCP_CLIENT;
+    return undefined;
+  }
+
+  /** Sanitize params for event logging — strip large payloads. */
+  private sanitizeParams(params: any): Record<string, unknown> {
+    if (!params || typeof params !== 'object') return {};
+    const p = params as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const [key, val] of Object.entries(p)) {
+      if (typeof val === 'string' && val.length > 200) {
+        out[key] = val.slice(0, 200) + '…';
+      } else {
+        out[key] = val;
+      }
+    }
+    return out;
+  }
+
+  // ─── Session State ──────────────────────────────────────────────
+
+  /** Get current session state (read-only copy). */
+  getSession(): SessionState {
+    return { ...this.session };
+  }
+
+  /** Update session state (partial merge). */
+  updateSession(updates: Partial<SessionState>): void {
+    Object.assign(this.session, updates);
+  }
+
+  /** Clear all session state. */
+  clearSession(): void {
+    this.session = {};
+  }
+
+  // ─── Result Summary Generation ─────────────────────────────────
+
+  /**
+   * Generate a 1-line result summary for Live Activity display.
+   * Parses tool results to produce human-readable summaries like
+   * "3 processes, 12 symbols" or "Risk: HIGH, 8 symbols affected".
+   */
+  private generateResultSummary(method: string, result: any): string | undefined {
+    if (result === null || result === undefined) return undefined;
+
+    try {
+      switch (method) {
+        case 'query': {
+          const r = result as any;
+          const procCount = r.processes?.length ?? 0;
+          const symCount =
+            r.process_symbols?.reduce(
+              (sum: number, ps: any) => sum + (ps.symbols?.length ?? 0),
+              0,
+            ) ?? 0;
+          const defCount = r.definitions?.length ?? 0;
+          const parts: string[] = [];
+          if (procCount > 0) parts.push(`${procCount} process${procCount !== 1 ? 'es' : ''}`);
+          if (symCount > 0) parts.push(`${symCount} symbol${symCount !== 1 ? 's' : ''}`);
+          if (defCount > 0) parts.push(`${defCount} definition${defCount !== 1 ? 's' : ''}`);
+          return parts.length > 0 ? parts.join(', ') : 'No results';
+        }
+
+        case 'context': {
+          const r = result as any;
+          const name = r.name ?? r.symbol?.name ?? 'symbol';
+          const type = r.symbol?.label ?? r.type ?? '';
+          const inCount = r.incoming?.length ?? 0;
+          const outCount = r.outgoing?.length ?? 0;
+          const procCount = r.participates_in_processes?.length ?? 0;
+          return `${name}${type ? ` (${type})` : ''} — ${inCount} in, ${outCount} out, ${procCount} processes`;
+        }
+
+        case 'impact': {
+          const r = result as any;
+          const risk = r.risk ?? 'UNKNOWN';
+          const totalAffected =
+            r.byDepth?.reduce((sum: number, d: any) => sum + (d.symbols?.length ?? 0), 0) ?? 0;
+          const procCount = r.affected_processes?.length ?? 0;
+          return `Risk: ${risk}${totalAffected > 0 ? `, ${totalAffected} symbols affected` : ''}${procCount > 0 ? `, ${procCount} processes` : ''}`;
+        }
+
+        case 'detect_changes': {
+          const r = result as any;
+          const changedCount = r.changed_symbols?.length ?? 0;
+          const procCount = r.affected_processes?.length ?? 0;
+          return `${changedCount} symbols changed${procCount > 0 ? `, ${procCount} processes affected` : ''}`;
+        }
+
+        case 'rename': {
+          const r = result as any;
+          const total = r.edits?.length ?? r.changes?.length ?? 0;
+          const isDry = r.dry_run ? ' (preview)' : '';
+          return `${total} edit${total !== 1 ? 's' : ''}${isDry}`;
+        }
+
+        case 'verify': {
+          const r = result as any;
+          if (r.error) return `Error: ${r.error}`;
+          const passed = r.passed ?? 0;
+          const failed = r.failed ?? 0;
+          const total = r.total ?? passed + failed;
+          return `${failed === 0 ? '✓' : '✗'} ${passed}/${total} passed${r.command ? ` (${r.command})` : ''}`;
+        }
+
+        default:
+          return undefined;
+      }
+    } catch {
+      return undefined;
+    }
+  }
+
   // ─── Tool Dispatch ───────────────────────────────────────────────
 
   async callTool(method: string, params: any): Promise<any> {
+    // ── Live activity event tracking ──────────────────────────────────
+    // Create a run for this tool call session and emit start/complete events
+    // so the web UI can show what the agent is doing in real-time.
+    const client = this.detectClient();
+    const runId = createRun(client);
+
+    // Resolve repo early so we can look up graph node IDs.
+    // Use the same resolution logic as _dispatchTool, but guard against missing repos.
+    let repo: RepoHandle | null = null;
+    try {
+      const repoParam = params?.repo;
+      repo = await this.resolveRepo(repoParam);
+    } catch {
+      // repo may not be indexed yet; node ID resolution will be skipped
+    }
+
+    const nodeIds = await this.resolveNodeIds(method, params, repo);
+
+    appendEvent(runId, {
+      source: 'mcp',
+      client,
+      event: 'tool.start',
+      message: `Called ${method}`,
+      payload: {
+        tool: method,
+        params: this.sanitizeParams(params),
+        nodeIds,
+      },
+    });
+
+    try {
+      const result = await this._dispatchTool(method, params);
+
+      // Generate result summary for Live Activity panel
+      const resultSummary = this.generateResultSummary(method, result);
+
+      // Update session state for audit/logging
+      this.updateSessionFromResult(method, params, result);
+
+      appendEvent(runId, {
+        source: 'mcp',
+        client,
+        event: 'tool.complete',
+        message: `${method} completed`,
+        payload: {
+          tool: method,
+          nodeIds,
+          result_summary: resultSummary,
+        },
+      });
+      completeRun(runId);
+
+      return result;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      appendEvent(runId, {
+        source: 'mcp',
+        client,
+        event: 'tool.error',
+        message: `${method} failed: ${message}`,
+        payload: {
+          tool: method,
+          error: message,
+        },
+      });
+      failRun(runId, message);
+      throw err;
+    }
+  }
+
+  /**
+   * Update session state based on tool results for cross-tool context.
+   */
+  private updateSessionFromResult(method: string, params: any, result: any): void {
+    const updates: Partial<SessionState> = {};
+    const p = (params as Record<string, unknown>) || {};
+
+    switch (method) {
+      case 'query': {
+        updates.lastQuery = p.query as string | undefined;
+        const symbols: string[] = [];
+        const r = result as any;
+        if (r?.process_symbols) {
+          for (const ps of r.process_symbols) {
+            if (ps.symbols) {
+              for (const s of ps.symbols) {
+                if (s.name) symbols.push(s.name);
+              }
+            }
+          }
+        }
+        updates.lastQuerySymbols = symbols.length > 0 ? symbols : undefined;
+        // Auto-focus: if only one process, focus on it
+        if (r?.processes?.length === 1) {
+          updates.focusProcess = r.processes[0].name;
+        }
+        updates.lastResult = result;
+        break;
+      }
+
+      case 'context': {
+        const name = (p.name as string) || (p.uid as string);
+        if (name) updates.lastContextSymbol = name;
+        updates.lastResult = result;
+        break;
+      }
+
+      case 'impact': {
+        updates.lastResult = result;
+        break;
+      }
+
+      case 'verify': {
+        updates.lastResult = result;
+        break;
+      }
+    }
+
+    if (Object.keys(updates).length > 0) {
+      this.updateSession(updates);
+    }
+  }
+
+  /** Actual tool dispatch (extracted from the original callTool body). */
+  private async _dispatchTool(method: string, params: any): Promise<any> {
     if (method === 'list_repos') {
       return this.listRepos();
     }
@@ -677,6 +994,12 @@ export class LocalBackend {
         return this.toolMap(repo, params);
       case 'api_impact':
         return this.apiImpact(repo, params);
+      case 'verify':
+        return this.verify(repo, params);
+      case 'group_list':
+        return this.groupList(params);
+      case 'group_sync':
+        return this.groupSync(params);
       default:
         throw new Error(`Unknown tool: ${method}`);
     }
@@ -3769,6 +4092,162 @@ export class LocalBackend {
         filePath: s.filePath || s[2],
       })),
     };
+  }
+
+  // ── Verify Tool ────────────────────────────────────
+
+  /**
+   * Run project verification: tests, linter, type-checker.
+   * Auto-detects project type and runs appropriate commands.
+   */
+  private async verify(
+    repo: RepoHandle,
+    params: { type?: 'test' | 'lint' | 'typecheck' | 'all'; command?: string; repo?: string },
+  ): Promise<any> {
+    const repoPath = repo.repoPath;
+
+    // If custom command provided, run it directly
+    if (params.command) {
+      return this.runVerifyCommand(repoPath, params.command, []);
+    }
+
+    const verifyType = params.type || 'all';
+    const results: Array<{ command: string; passed: number; failed: number; output: string }> = [];
+
+    // Detect project type and build command list
+    const commands: Array<{ cmd: string; args: string[]; type: string }> = [];
+
+    // Check for package.json (Node.js)
+    try {
+      await fs.access(path.join(repoPath, 'package.json'));
+      if (verifyType === 'test' || verifyType === 'all') {
+        commands.push({ cmd: 'npm', args: ['test'], type: 'test' });
+      }
+      if (verifyType === 'lint' || verifyType === 'all') {
+        commands.push({ cmd: 'npm', args: ['run', 'lint'], type: 'lint' });
+      }
+      if (verifyType === 'typecheck' || verifyType === 'all') {
+        commands.push({ cmd: 'npx', args: ['tsc', '--noEmit'], type: 'typecheck' });
+      }
+    } catch {}
+
+    // Check for pyproject.toml (Python)
+    if (commands.length === 0) {
+      try {
+        await fs.access(path.join(repoPath, 'pyproject.toml'));
+        if (verifyType === 'test' || verifyType === 'all') {
+          commands.push({ cmd: 'python', args: ['-m', 'pytest'], type: 'test' });
+        }
+        if (verifyType === 'lint' || verifyType === 'all') {
+          commands.push({ cmd: 'python', args: ['-m', 'flake8'], type: 'lint' });
+        }
+        if (verifyType === 'typecheck' || verifyType === 'all') {
+          commands.push({ cmd: 'python', args: ['-m', 'mypy', '.'], type: 'typecheck' });
+        }
+      } catch {}
+    }
+
+    // Check for go.mod (Go)
+    if (commands.length === 0) {
+      try {
+        await fs.access(path.join(repoPath, 'go.mod'));
+        if (verifyType === 'test' || verifyType === 'all') {
+          commands.push({ cmd: 'go', args: ['test', './...'], type: 'test' });
+        }
+        if (verifyType === 'lint' || verifyType === 'all') {
+          commands.push({ cmd: 'go', args: ['vet', './...'], type: 'lint' });
+        }
+      } catch {}
+    }
+
+    // Check for Cargo.toml (Rust)
+    if (commands.length === 0) {
+      try {
+        await fs.access(path.join(repoPath, 'Cargo.toml'));
+        if (verifyType === 'test' || verifyType === 'all') {
+          commands.push({ cmd: 'cargo', args: ['test'], type: 'test' });
+        }
+        if (verifyType === 'lint' || verifyType === 'all') {
+          commands.push({ cmd: 'cargo', args: ['clippy'], type: 'lint' });
+        }
+      } catch {}
+    }
+
+    if (commands.length === 0) {
+      return { error: 'Could not detect project type. Please provide a custom command.' };
+    }
+
+    // Run each command
+    for (const { cmd, args, type } of commands) {
+      try {
+        const result = await this.runVerifyCommand(repoPath, cmd, args);
+        results.push({ command: `${cmd} ${args.join(' ')}`, ...result });
+      } catch (err: any) {
+        results.push({
+          command: `${cmd} ${args.join(' ')}`,
+          passed: 0,
+          failed: 0,
+          output: `Failed to run: ${err.message}`,
+        });
+      }
+    }
+
+    const totalPassed = results.reduce((sum, r) => sum + r.passed, 0);
+    const totalFailed = results.reduce((sum, r) => sum + r.failed, 0);
+    const total = totalPassed + totalFailed;
+
+    return {
+      passed: totalPassed,
+      failed: totalFailed,
+      total,
+      results,
+      command: results.map((r) => r.command).join(', '),
+    };
+  }
+
+  private async runVerifyCommand(
+    repoPath: string,
+    cmd: string,
+    args: string[] = [],
+  ): Promise<{ passed: number; failed: number; output: string }> {
+    return new Promise((resolve) => {
+      const proc = spawn(cmd, args, {
+        cwd: repoPath,
+        shell: true,
+        timeout: 300000,
+      });
+
+      let output = '';
+      proc.stdout?.on('data', (d: Buffer) => {
+        output += d.toString();
+      });
+      proc.stderr?.on('data', (d: Buffer) => {
+        output += d.toString();
+      });
+
+      proc.on('close', (code) => {
+        const passed = (output.match(/pass(ed|ing|es)|✓|✔/gi) || []).length;
+        const failed = (output.match(/fail(ed|ing|s)|✗|✖/gi) || []).length;
+
+        if (passed === 0 && failed === 0) {
+          if (code === 0) {
+            resolve({ passed: 1, failed: 0, output: output.slice(0, 2000) });
+          } else {
+            resolve({ passed: 0, failed: 1, output: output.slice(0, 2000) });
+          }
+        } else {
+          resolve({
+            passed: passed || 0,
+            failed: failed || (code !== 0 ? 1 : 0),
+            output: output.slice(0, 2000),
+          });
+        }
+      });
+
+      proc.on('error', (err) => {
+        resolve({ passed: 0, failed: 0, output: `Process error: ${err.message}` });
+      });
+    });
   }
 
   async disconnect(): Promise<void> {

@@ -1,7 +1,8 @@
 /**
  * Repository Manager
  *
- * Manages GitNexus index storage in .gitnexus/ at repo root.
+ * Manages GitNexus index storage in ~/.gitnexus/indices/<name>-<hash>/
+ * so the index never touches the target repo's working tree.
  * Also maintains a global registry at ~/.gitnexus/registry.json
  * so the MCP server can discover indexed repos from any cwd.
  */
@@ -10,6 +11,7 @@ import fs from 'fs/promises';
 import { realpathSync } from 'fs';
 import path from 'path';
 import os from 'os';
+import { createHash } from 'crypto';
 import { getInferredRepoName } from './git.js';
 
 /**
@@ -96,14 +98,30 @@ export interface RegistryEntry {
 }
 
 const GITNEXUS_DIR = '.gitnexus';
+/** Subdirectory of ~/.gitnexus/ where per-repo indexes are stored. */
+const INDICES_SUBDIR = 'indices';
 
 // ─── Local Storage Helpers ─────────────────────────────────────────────
 
 /**
- * Get the .gitnexus storage path for a repository
+ * Derive a short, stable, filesystem-safe identifier for a repo path.
+ * Uses the last path segment plus a 12-hex-char sha256 prefix so two
+ * repos with the same basename (e.g. two `app/` checkouts) never collide.
+ */
+const repoStorageId = (canonicalPath: string): string => {
+  const name = path.basename(canonicalPath).replace(/[^a-zA-Z0-9._-]/g, '_') || 'repo';
+  const hash = createHash('sha256').update(canonicalPath).digest('hex').slice(0, 12);
+  return `${name}-${hash}`;
+};
+
+/**
+ * Get the central storage path for a repository.
+ * Stored at ~/.gitnexus/indices/<name>-<hash>/ so the target repo's
+ * working tree is never dirtied.
  */
 export const getStoragePath = (repoPath: string): string => {
-  return path.join(path.resolve(repoPath), GITNEXUS_DIR);
+  const canonical = path.resolve(repoPath);
+  return path.join(getGlobalDir(), INDICES_SUBDIR, repoStorageId(canonical));
 };
 
 /**
@@ -222,18 +240,51 @@ export const loadRepo = async (repoPath: string): Promise<IndexedRepo | null> =>
 };
 
 /**
- * Find .gitnexus by walking up from a starting path
+ * Find the indexed repo that owns a given path.
+ *
+ * Strategy:
+ *   1. Registry-first: find the deepest registered entry whose path is an
+ *      ancestor of (or equal to) startPath. This works for both central-store
+ *      and legacy in-repo indexes without touching the working tree.
+ *   2. Legacy fallback: walk up the filesystem looking for an in-repo
+ *      .gitnexus/ directory, for indexes created before central storage.
  */
 export const findRepo = async (startPath: string): Promise<IndexedRepo | null> => {
+  const canonical = canonicalizePath(startPath);
+  const entries = await readRegistry();
+
+  // Find the deepest registered ancestor
+  let best: RegistryEntry | null = null;
+  let bestLen = -1;
+  for (const entry of entries) {
+    const ec = canonicalizePath(entry.path);
+    const prefix = ec + path.sep;
+    if (canonical === ec || canonical.startsWith(prefix)) {
+      if (ec.length > bestLen) {
+        best = entry;
+        bestLen = ec.length;
+      }
+    }
+  }
+  if (best) return loadRepo(best.path);
+
+  // Legacy fallback: in-repo .gitnexus/ walk
   let current = path.resolve(startPath);
   const root = path.parse(current).root;
-
   while (current !== root) {
-    const repo = await loadRepo(current);
-    if (repo) return repo;
+    const legacyStorage = path.join(current, GITNEXUS_DIR);
+    const meta = await loadMeta(legacyStorage);
+    if (meta) {
+      return {
+        repoPath: current,
+        storagePath: legacyStorage,
+        lbugPath: path.join(legacyStorage, 'lbug'),
+        metaPath: path.join(legacyStorage, 'meta.json'),
+        meta,
+      };
+    }
     current = path.dirname(current);
   }
-
   return null;
 };
 
@@ -275,24 +326,43 @@ export const getGlobalRegistryPath = (): string => {
 
 /**
  * Read the global registry. Returns empty array if not found.
+ * Throws on corruption or permission errors to prevent accidental registry
+ * wipes (#issue: registry is wiped when JSON.parse fails).
  */
 export const readRegistry = async (): Promise<RegistryEntry[]> => {
+  const registryPath = getGlobalRegistryPath();
   try {
-    const raw = await fs.readFile(getGlobalRegistryPath(), 'utf-8');
-    const data = JSON.parse(raw);
-    return Array.isArray(data) ? data : [];
-  } catch {
-    return [];
+    const raw = await fs.readFile(registryPath, 'utf-8');
+    return JSON.parse(raw);
+  } catch (err: any) {
+    if (err.code === 'ENOENT') return [];
+    throw err;
   }
 };
 
 /**
- * Write the global registry to disk
+ * Write the global registry to disk. Uses a temporary file and atomic
+ * rename to prevent corruption if the process is interrupted.
  */
 const writeRegistry = async (entries: RegistryEntry[]): Promise<void> => {
   const dir = getGlobalDir();
   await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(getGlobalRegistryPath(), JSON.stringify(entries, null, 2), 'utf-8');
+
+  const registryPath = getGlobalRegistryPath();
+  const tempPath = `${registryPath}.tmp.${Date.now()}`;
+
+  try {
+    await fs.writeFile(tempPath, JSON.stringify(entries, null, 2), 'utf-8');
+    await fs.rename(tempPath, registryPath);
+  } catch (err) {
+    // Clean up temp file on failure
+    try {
+      await fs.unlink(tempPath);
+    } catch {
+      /* ignore */
+    }
+    throw err;
+  }
 };
 
 /**
@@ -619,14 +689,22 @@ export class UnsafeStoragePathError extends Error {
  * comparison shape used elsewhere in this module.
  */
 export const assertSafeStoragePath = (entry: RegistryEntry): void => {
-  const expected = path.join(path.resolve(entry.path), '.gitnexus');
   const actual = path.resolve(entry.storagePath);
-  const matches =
-    process.platform === 'win32'
-      ? expected.toLowerCase() === actual.toLowerCase()
-      : expected === actual;
-  if (!matches) {
-    throw new UnsafeStoragePathError(entry, expected, actual);
+  const isWin = process.platform === 'win32';
+  const eq = (a: string, b: string) => (isWin ? a.toLowerCase() === b.toLowerCase() : a === b);
+
+  // Accept central store: ~/.gitnexus/indices/<anything>
+  const centralBase = path.join(getGlobalDir(), INDICES_SUBDIR) + path.sep;
+  const isCentral = isWin
+    ? actual.toLowerCase().startsWith(centralBase.toLowerCase())
+    : actual.startsWith(centralBase);
+
+  // Accept legacy in-repo: <repo>/.gitnexus  (backward compat for existing indexes)
+  const legacyExpected = path.join(path.resolve(entry.path), GITNEXUS_DIR);
+  const isLegacy = eq(actual, legacyExpected);
+
+  if (!isCentral && !isLegacy) {
+    throw new UnsafeStoragePathError(entry, centralBase.slice(0, -1), actual);
   }
 };
 

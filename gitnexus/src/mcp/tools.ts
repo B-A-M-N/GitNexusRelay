@@ -548,4 +548,46 @@ Returns: pass/fail counts, failure details with file paths and line numbers, and
       required: [],
     },
   },
+  {
+    name: 'index',
+    description: `Index a repository (full analysis).
+Builds or refreshes the knowledge graph for a codebase.
+
+WHEN TO USE:
+- When a new repository needs to be indexed for GitNexus.
+- When an existing index is stale and needs a full refresh.
+- When semantic search (embeddings) needs to be enabled for a repo.
+
+NOTE: This is a long-running operation for large repos. The tool returns stats after completion.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description:
+            'Absolute path to the repository root. Defaults to current working directory.',
+        },
+        force: {
+          type: 'boolean',
+          description: 'Force full re-index even if up to date (default: false)',
+          default: false,
+        },
+        embeddings: {
+          type: 'boolean',
+          description: 'Enable embedding generation for semantic search (default: false)',
+          default: false,
+        },
+        name: {
+          type: 'string',
+          description: 'Custom name/alias for the repository in the registry.',
+        },
+        repo: {
+          type: 'string',
+          description:
+            'Repository name or path (alias for path). Omit if indexing current directory.',
+        },
+      },
+      required: [],
+    },
+  },
 ];

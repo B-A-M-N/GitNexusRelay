@@ -13,8 +13,8 @@ import { GITNEXUS_TOOLS } from '../../src/mcp/tools.js';
 const GROUP_TOOLS = new Set(['group_list', 'group_sync']);
 
 describe('GITNEXUS_TOOLS', () => {
-  it('exports all tools (7 base + 3 route/tool/shape + 1 api_impact + 2 group)', () => {
-    expect(GITNEXUS_TOOLS).toHaveLength(13);
+  it('exports all tools (7 base + 3 route/tool/shape + 1 api_impact + 2 group + 2 new)', () => {
+    expect(GITNEXUS_TOOLS).toHaveLength(15);
   });
 
   it('contains all expected tool names', () => {

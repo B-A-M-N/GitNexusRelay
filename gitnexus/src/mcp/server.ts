@@ -7,7 +7,7 @@
  *
  * Supports multiple indexed repositories via the global registry.
  *
- * Tools: list_repos, query, cypher, context, impact, detect_changes, rename
+ * Tools: list_repos, index, query, cypher, context, impact, detect_changes, rename
  * Resources: repos, repo/{name}/context, repo/{name}/clusters, ...
  */
 
@@ -45,6 +45,9 @@ function getNextStepHint(toolName: string, args: Record<string, any> | undefined
   switch (toolName) {
     case 'list_repos':
       return `\n\n---\n**Next:** READ gitnexus://repo/{name}/context for any repo above to get its overview and check staleness.`;
+
+    case 'index':
+      return `\n\n---\n**Next:** Once indexing is complete, use list_repos() to confirm the repo is available, then READ gitnexus://repo/${repoPath}/context.`;
 
     case 'query':
       return `\n\n---\n**Next:** To understand a specific symbol in depth, use context({name: "<symbol_name>"${repoParam}}) to see categorized refs and process participation.`;

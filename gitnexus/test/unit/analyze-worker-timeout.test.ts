@@ -19,6 +19,7 @@ vi.mock('../../src/storage/repo-manager.js', () => ({
 vi.mock('../../src/storage/git.js', () => ({
   getGitRoot: vi.fn(() => '/repo'),
   hasGitDir: vi.fn(() => true),
+  isGitRepo: vi.fn(() => true),
 }));
 
 vi.mock('../../src/core/ingestion/utils/max-file-size.js', () => ({

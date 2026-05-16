@@ -14,8 +14,8 @@ import fs from 'fs/promises';
 import {
   getStoragePaths,
   loadMeta,
-  addToGitignore,
   registerRepo,
+  addToGitignore,
 } from '../storage/repo-manager.js';
 import { getGitRoot, getRemoteUrl, isGitRepo } from '../storage/git.js';
 

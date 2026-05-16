@@ -5,7 +5,7 @@
  */
 
 import { findRepo, getStoragePaths, hasKuzuIndex } from '../storage/repo-manager.js';
-import { getCurrentCommit, isGitRepo, getGitRoot } from '../storage/git.js';
+import { getCurrentCommit, isGitRepo, getGitRoot, hasUncommittedChanges } from '../storage/git.js';
 
 export const statusCommand = async () => {
   const cwd = process.cwd();
@@ -32,10 +32,17 @@ export const statusCommand = async () => {
 
   const currentCommit = getCurrentCommit(repo.repoPath);
   const isUpToDate = currentCommit === repo.meta.lastCommit;
+  const dirty = await hasUncommittedChanges(repo.repoPath);
 
   console.log(`Repository: ${repo.repoPath}`);
   console.log(`Indexed: ${new Date(repo.meta.indexedAt).toLocaleString()}`);
   console.log(`Indexed commit: ${repo.meta.lastCommit?.slice(0, 7)}`);
   console.log(`Current commit: ${currentCommit?.slice(0, 7)}`);
-  console.log(`Status: ${isUpToDate ? '✅ up-to-date' : '⚠️ stale (re-run gitnexus analyze)'}`);
+
+  if (dirty) {
+    console.log('Status: ⚠️ uncommitted changes (index may be slightly out of sync)');
+    console.log('        Run `gitnexus analyze --force` to refresh with local changes.');
+  } else {
+    console.log(`Status: ${isUpToDate ? '✅ up-to-date' : '⚠️ stale (re-run gitnexus analyze)'}`);
+  }
 };

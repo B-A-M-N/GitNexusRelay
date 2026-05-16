@@ -32,15 +32,26 @@ import { createTempDir } from '../helpers/test-db.js';
 // ─── getStoragePath ──────────────────────────────────────────────────
 
 describe('getStoragePath', () => {
-  it('appends .gitnexus to resolved repo path', () => {
+  it('stores under ~/.gitnexus/indices/, not inside the repo', () => {
     const result = getStoragePath('/home/user/project');
-    expect(result).toContain('.gitnexus');
-    expect(path.basename(result)).toBe('.gitnexus');
+    expect(result).toContain('indices');
+    expect(result).not.toMatch(/^\/home\/user\/project/);
+    expect(path.isAbsolute(result)).toBe(true);
   });
 
-  it('resolves relative paths', () => {
+  it('includes the repo basename in the storage dir name', () => {
+    const result = getStoragePath('/home/user/my-project');
+    expect(path.basename(result)).toMatch(/^my-project-/);
+  });
+
+  it('two repos with the same basename get different storage paths', () => {
+    const a = getStoragePath('/workspace/a/app');
+    const b = getStoragePath('/workspace/b/app');
+    expect(a).not.toBe(b);
+  });
+
+  it('resolves relative paths to absolute storage path', () => {
     const result = getStoragePath('.');
-    // Should be an absolute path
     expect(path.isAbsolute(result)).toBe(true);
   });
 });
@@ -50,7 +61,6 @@ describe('getStoragePath', () => {
 describe('getStoragePaths', () => {
   it('returns storagePath, lbugPath, metaPath', () => {
     const paths = getStoragePaths('/home/user/project');
-    expect(paths.storagePath).toContain('.gitnexus');
     expect(paths.lbugPath).toContain('lbug');
     expect(paths.metaPath).toContain('meta.json');
   });
@@ -705,6 +715,8 @@ describe('resolveRegistryEntry backward-compat with non-canonical stored paths (
 describe('assertSafeStoragePath (#1003)', () => {
   const prefix = process.platform === 'win32' ? 'D:\\' : '/tmp/';
   const repoPath = `${prefix}projects${path.sep}my-repo`;
+  const globalDir = process.env.GITNEXUS_HOME || path.join(os.homedir(), '.gitnexus');
+  const centralStorage = path.join(globalDir, 'indices', 'my-repo-abc123456def');
   const base: Omit<RegistryEntry, 'storagePath'> = {
     name: 'my-repo',
     path: repoPath,
@@ -712,7 +724,12 @@ describe('assertSafeStoragePath (#1003)', () => {
     lastCommit: 'deadbee',
   };
 
-  it('accepts the canonical <repo>/.gitnexus storage path', () => {
+  it('accepts a central-store path under ~/.gitnexus/indices/', () => {
+    const entry: RegistryEntry = { ...base, storagePath: centralStorage };
+    expect(() => assertSafeStoragePath(entry)).not.toThrow();
+  });
+
+  it('accepts a legacy in-repo <repo>/.gitnexus path for backward compat', () => {
     const entry: RegistryEntry = {
       ...base,
       storagePath: path.join(repoPath, '.gitnexus'),
@@ -721,26 +738,17 @@ describe('assertSafeStoragePath (#1003)', () => {
   });
 
   it('rejects when storagePath equals the repo path itself (would delete the code)', () => {
-    const entry: RegistryEntry = {
-      ...base,
-      storagePath: repoPath, // catastrophic: rm the working tree
-    };
+    const entry: RegistryEntry = { ...base, storagePath: repoPath };
     expect(() => assertSafeStoragePath(entry)).toThrow(UnsafeStoragePathError);
   });
 
   it('rejects when storagePath is a parent of the repo path', () => {
-    const entry: RegistryEntry = {
-      ...base,
-      storagePath: path.dirname(repoPath), // also catastrophic
-    };
+    const entry: RegistryEntry = { ...base, storagePath: path.dirname(repoPath) };
     expect(() => assertSafeStoragePath(entry)).toThrow(UnsafeStoragePathError);
   });
 
   it('rejects when storagePath is empty (path.resolve falls back to cwd)', () => {
-    const entry: RegistryEntry = {
-      ...base,
-      storagePath: '', // path.resolve('') === process.cwd() — would rm cwd
-    };
+    const entry: RegistryEntry = { ...base, storagePath: '' };
     expect(() => assertSafeStoragePath(entry)).toThrow(UnsafeStoragePathError);
   });
 
@@ -752,19 +760,13 @@ describe('assertSafeStoragePath (#1003)', () => {
     expect(() => assertSafeStoragePath(entry)).toThrow(UnsafeStoragePathError);
   });
 
-  it('rejects when storagePath is a sibling .gitnexus (right basename, wrong parent)', () => {
-    const entry: RegistryEntry = {
-      ...base,
-      storagePath: path.join(`${prefix}different${path.sep}repo`, '.gitnexus'),
-    };
+  it('rejects ~/.gitnexus itself (not inside indices/ subdirectory)', () => {
+    const entry: RegistryEntry = { ...base, storagePath: globalDir };
     expect(() => assertSafeStoragePath(entry)).toThrow(UnsafeStoragePathError);
   });
 
-  it('UnsafeStoragePathError carries the original entry + expected + actual paths', () => {
-    const entry: RegistryEntry = {
-      ...base,
-      storagePath: `${prefix}evil${path.sep}path`,
-    };
+  it('UnsafeStoragePathError carries the original entry and actual path', () => {
+    const entry: RegistryEntry = { ...base, storagePath: `${prefix}evil${path.sep}path` };
     try {
       assertSafeStoragePath(entry);
     } catch (e) {
@@ -772,22 +774,14 @@ describe('assertSafeStoragePath (#1003)', () => {
       const err = e as UnsafeStoragePathError;
       expect(err.kind).toBe('UnsafeStoragePathError');
       expect(err.entry).toBe(entry);
-      // Expected path is the canonical `<repo>/.gitnexus`.
-      expect(err.expectedStoragePath).toBe(path.join(path.resolve(repoPath), '.gitnexus'));
-      // Actual path is the corrupted value (resolved).
       expect(err.actualStoragePath).toBe(path.resolve(entry.storagePath));
-      // Message must suggest the recovery action.
       expect(err.message).toContain('registry.json');
     }
   });
 
-  it('Windows: storagePath match is case-insensitive to match register/unregister semantics', () => {
+  it('Windows: central-store match is case-insensitive', () => {
     if (process.platform !== 'win32') return;
-    const entry: RegistryEntry = {
-      ...base,
-      storagePath: path.join(repoPath.toUpperCase(), '.GITNEXUS'),
-    };
-    // Should accept because Windows paths are case-insensitive.
+    const entry: RegistryEntry = { ...base, storagePath: centralStorage.toUpperCase() };
     expect(() => assertSafeStoragePath(entry)).not.toThrow();
   });
 });

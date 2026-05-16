@@ -26,11 +26,11 @@ import {
   getStoragePaths,
   saveMeta,
   loadMeta,
-  addToGitignore,
   registerRepo,
   cleanupOldKuzuFiles,
+  addToGitignore,
 } from '../storage/repo-manager.js';
-import { getCurrentCommit, getRemoteUrl, hasGitDir, getInferredRepoName } from '../storage/git.js';
+import { getCurrentCommit, getRemoteUrl, isGitRepo, getInferredRepoName } from '../storage/git.js';
 import type { CachedEmbedding } from './embeddings/types.js';
 import { generateAIContextFiles } from '../cli/ai-context.js';
 import { EMBEDDING_TABLE_NAME } from './lbug/schema.js';
@@ -158,7 +158,8 @@ export async function runFullAnalysis(
     log('Migrating from KuzuDB to LadybugDB — rebuilding index...');
   }
 
-  const repoHasGit = hasGitDir(repoPath);
+  // Use isGitRepo instead of hasGitDir (#issue: subdirectories fail git detection)
+  const repoHasGit = isGitRepo(repoPath);
   const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
   const existingMeta = await loadMeta(storagePath);
 
@@ -263,10 +264,20 @@ export async function runFullAnalysis(
   for (const f of lbugFiles) {
     try {
       await fs.rm(f, { recursive: true, force: true });
-    } catch {
-      /* swallow */
+    } catch (err) {
+      // Don't swallow errors for the main database file during a force re-index.
+      // EBUSY on Windows or permission issues on Linux must be reported.
+      if (f === lbugPath && options.force) {
+        throw new Error(
+          `Failed to clear existing index at ${f}: ${(err as Error).message}. ` +
+            `Ensure no other process (like an MCP server) is using it.`,
+        );
+      }
     }
   }
+
+  // Use a short delay to allow OS to release file handles after closeLbug()
+  await new Promise((resolve) => setTimeout(resolve, 100));
 
   await initLbug(lbugPath);
   try {
@@ -389,7 +400,7 @@ export async function runFullAnalysis(
       // a second git shellout. `undefined` when the repo has no
       // origin remote, which is fine: paths-only repos behave as
       // before.
-      remoteUrl: hasGitDir(repoPath) ? getRemoteUrl(repoPath) : undefined,
+      remoteUrl: isGitRepo(repoPath) ? getRemoteUrl(repoPath) : undefined,
       stats: {
         files: pipelineResult.totalFileCount,
         nodes: stats.nodes,
@@ -413,11 +424,7 @@ export async function runFullAnalysis(
       name: options.registryName,
       allowDuplicateName: options.allowDuplicateName,
     });
-
-    // Only attempt to update .gitignore when a .git directory is present.
-    if (hasGitDir(repoPath)) {
-      await addToGitignore(repoPath);
-    }
+    await addToGitignore(repoPath);
 
     // ── Generate AI context files (best-effort) ───────────────────────
     let aggregatedClusterCount = 0;

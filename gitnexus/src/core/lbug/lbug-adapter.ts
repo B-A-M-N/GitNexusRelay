@@ -209,8 +209,33 @@ const runWithSessionLock = async <T>(operation: () => Promise<T>): Promise<T> =>
 
 const normalizeCopyPath = (filePath: string): string => filePath.replace(/\\/g, '/');
 
-export const initLbug = async (dbPath: string) => {
-  return runWithSessionLock(() => ensureLbugInitialized(dbPath));
+export const initLbug = async (dbPath: string): Promise<void> => {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= DB_LOCK_RETRY_ATTEMPTS; attempt++) {
+    try {
+      await runWithSessionLock(() => ensureLbugInitialized(dbPath));
+      return;
+    } catch (err) {
+      lastError = err;
+      if (!isDbBusyError(err) || attempt === DB_LOCK_RETRY_ATTEMPTS) {
+        throw err;
+      }
+      // Close any partial handles before retry
+      await runWithSessionLock(async () => {
+        try {
+          if (conn) await conn.close();
+        } catch {}
+        try {
+          if (db) await db.close();
+        } catch {}
+        conn = null;
+        db = null;
+        currentDbPath = null;
+      });
+      await new Promise((resolve) => setTimeout(resolve, DB_LOCK_RETRY_DELAY_MS * attempt));
+    }
+  }
+  throw lastError;
 };
 
 /**

@@ -35,6 +35,7 @@ import { collectBestChunks } from '../../core/embeddings/types.js';
 import { EMBEDDING_TABLE_NAME, EMBEDDING_INDEX_NAME } from '../../core/lbug/schema.js';
 import { PhaseTimer } from '../../core/search/phase-timer.js';
 import { checkStaleness, checkCwdMatch } from '../../core/git-staleness.js';
+import { runFullAnalysis } from '../../core/run-analyze.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 
@@ -935,6 +936,11 @@ export class LocalBackend {
         updates.lastResult = result;
         break;
       }
+
+      case 'index': {
+        updates.lastResult = result;
+        break;
+      }
     }
 
     if (Object.keys(updates).length > 0) {
@@ -946,6 +952,10 @@ export class LocalBackend {
   private async _dispatchTool(method: string, params: any): Promise<any> {
     if (method === 'list_repos') {
       return this.listRepos();
+    }
+
+    if (method === 'index') {
+      return this.index(params || {});
     }
 
     if (method.startsWith('group_')) {
@@ -4248,6 +4258,66 @@ export class LocalBackend {
         resolve({ passed: 0, failed: 0, output: `Process error: ${err.message}` });
       });
     });
+  }
+
+  // ─── Index Tool ───────────────────────────────────────────────────
+
+  /**
+   * Index a repository (full analysis).
+   * Builds or refreshes the knowledge graph for a codebase.
+   */
+  private async index(params: {
+    path?: string;
+    repo?: string;
+    force?: boolean;
+    embeddings?: boolean;
+    name?: string;
+  }): Promise<any> {
+    let repoPath: string;
+
+    if (params.repo) {
+      try {
+        const handle = await this.resolveRepo(params.repo);
+        repoPath = handle.repoPath;
+      } catch (err) {
+        // If repo not found by name, assume it might be a path if no path param provided
+        if (!params.path) {
+          repoPath = path.resolve(params.repo);
+        } else {
+          throw err;
+        }
+      }
+    } else {
+      repoPath = path.resolve(params.path || process.cwd());
+    }
+
+    const result = await runFullAnalysis(
+      repoPath,
+      {
+        force: params.force,
+        embeddings: params.embeddings,
+        registryName: params.name,
+      },
+      {
+        onProgress: (phase, percent, message) => {
+          // Log progress to stderr so the operator can see it in MCP logs
+          process.stderr.write(`  [${percent}%] ${phase}: ${message}\n`);
+        },
+        onLog: (msg) => {
+          process.stderr.write(`  ${msg}\n`);
+        },
+      },
+    );
+
+    // Refresh the in-memory registry so the new/updated repo is immediately available
+    await this.refreshRepos();
+
+    return {
+      repoName: result.repoName,
+      repoPath: result.repoPath,
+      stats: result.stats,
+      alreadyUpToDate: result.alreadyUpToDate,
+    };
   }
 
   async disconnect(): Promise<void> {

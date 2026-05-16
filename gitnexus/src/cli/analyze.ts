@@ -18,7 +18,7 @@ import {
   getGlobalRegistryPath,
   RegistryNameCollisionError,
 } from '../storage/repo-manager.js';
-import { getGitRoot, hasGitDir } from '../storage/git.js';
+import { getGitRoot, isGitRepo } from '../storage/git.js';
 import { runFullAnalysis } from '../core/run-analyze.js';
 import { getMaxFileSizeBannerMessage } from '../core/ingestion/utils/max-file-size.js';
 import fs from 'fs/promises';
@@ -140,7 +140,7 @@ export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOption
     }
   }
 
-  const repoHasGit = hasGitDir(repoPath);
+  const repoHasGit = isGitRepo(repoPath);
   if (!repoHasGit && !options?.skipGit) {
     console.log(
       '  Not a git repository.\n  Tip: pass --skip-git to index any folder without a .git directory.\n',

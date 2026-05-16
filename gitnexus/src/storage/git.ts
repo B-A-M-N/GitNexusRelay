@@ -165,6 +165,23 @@ export const getInferredRepoName = (repoPath: string): string | null => {
   return parseRepoNameFromUrl(getRemoteOriginUrl(repoPath));
 };
 
+/**
+ * Check if the repository has uncommitted changes (dirty worktree).
+ */
+export const hasUncommittedChanges = async (repoPath: string): Promise<boolean> => {
+  try {
+    const status = execSync('git status --porcelain', {
+      cwd: repoPath,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+      .toString()
+      .trim();
+    return status.length > 0;
+  } catch {
+    return false;
+  }
+};
+
 export interface DiffHunk {
   startLine: number;
   endLine: number;

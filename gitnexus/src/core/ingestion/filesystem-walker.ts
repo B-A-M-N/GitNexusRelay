@@ -4,6 +4,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { glob } from 'glob';
 import { createIgnoreFilter } from '../../config/ignore-service.js';
+import { tryATreeWalker } from './atree-walker.js';
 
 export interface FileEntry {
   path: string;
@@ -26,11 +27,20 @@ const READ_CONCURRENCY = 32;
 /**
  * Phase 1: Scan repository — stat files to get paths + sizes, no content loaded.
  * Memory: ~10MB for 100K files vs ~1GB+ with content.
+ *
+ * Uses ATree (fast Rust scanner) if available, falls back to glob+stat.
  */
 export const walkRepositoryPaths = async (
   repoPath: string,
   onProgress?: (current: number, total: number, filePath: string) => void,
 ): Promise<ScannedFile[]> => {
+  // Attempt ATree first (fast path)
+  const atreeResult = await tryATreeWalker(repoPath, onProgress);
+  if (atreeResult !== null) {
+    return atreeResult.files;
+  }
+
+  // Fall back to glob+stat
   const ignoreFilter = await createIgnoreFilter(repoPath);
   const maxFileSizeBytes = getMaxFileSizeBytes();
 
